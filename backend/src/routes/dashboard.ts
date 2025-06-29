@@ -1,110 +1,105 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { db } from '../db/init';
-import { DashboardStats } from '../types';
+import Transaction from '../models/Transaction';
 
 const router = Router();
 
 // Apply authentication to all dashboard routes
 router.use(authenticateToken);
 
-// Get dashboard statistics
-router.get('/stats', async (req, res) => {
+// GET /api/dashboard/stats - Get dashboard statistics
+router.get('/stats', async (req: Request, res: Response) => {
   try {
-    // Get total revenue
-    const totalRevenue = await new Promise<number>((resolve, reject) => {
-      db.get(
-        'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE category = "Revenue"',
-        (err, row: any) => {
-          if (err) reject(err);
-          else resolve(row.total);
+    const userId = (req as any).user.userId;
+
+    // Get all transactions for the user
+    const transactions = await Transaction.find({ userId });
+
+    // Calculate statistics
+    const totalRevenue = transactions
+      .filter(t => t.category === 'Revenue')
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    const totalExpenses = transactions
+      .filter(t => t.category === 'Expense')
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    const netIncome = totalRevenue - totalExpenses;
+
+    const pendingAmount = transactions
+      .filter(t => t.status === 'Pending')
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    const paidAmount = transactions
+      .filter(t => t.status === 'Paid')
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    const transactionCount = transactions.length;
+
+    // Get monthly data for the last 6 months
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+    const monthlyData = await Transaction.aggregate([
+      {
+        $match: {
+          userId: userId,
+          date: { $gte: sixMonthsAgo }
         }
-      );
-    });
-
-    // Get total expenses
-    const totalExpenses = await new Promise<number>((resolve, reject) => {
-      db.get(
-        'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE category = "Expense"',
-        (err, row: any) => {
-          if (err) reject(err);
-          else resolve(row.total);
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$date' },
+            month: { $month: '$date' }
+          },
+          revenue: {
+            $sum: {
+              $cond: [
+                { $eq: ['$category', 'Revenue'] },
+                '$amount',
+                0
+              ]
+            }
+          },
+          expenses: {
+            $sum: {
+              $cond: [
+                { $eq: ['$category', 'Expense'] },
+                '$amount',
+                0
+              ]
+            }
+          }
         }
-      );
-    });
+      },
+      {
+        $sort: { '_id.year': 1, '_id.month': 1 }
+      }
+    ]);
 
-    // Get pending amount
-    const pendingAmount = await new Promise<number>((resolve, reject) => {
-      db.get(
-        'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE status = "Pending"',
-        (err, row: any) => {
-          if (err) reject(err);
-          else resolve(row.total);
-        }
-      );
-    });
-
-    // Get paid amount
-    const paidAmount = await new Promise<number>((resolve, reject) => {
-      db.get(
-        'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE status = "Paid"',
-        (err, row: any) => {
-          if (err) reject(err);
-          else resolve(row.total);
-        }
-      );
-    });
-
-    // Get total transaction count
-    const transactionCount = await new Promise<number>((resolve, reject) => {
-      db.get(
-        'SELECT COUNT(*) as count FROM transactions',
-        (err, row: any) => {
-          if (err) reject(err);
-          else resolve(row.count);
-        }
-      );
-    });
-
-    // Get monthly data for the last 12 months
-    const monthlyData = await new Promise<any[]>((resolve, reject) => {
-      db.all(`
-        SELECT 
-          strftime('%Y-%m', date) as month,
-          SUM(CASE WHEN category = 'Revenue' THEN amount ELSE 0 END) as revenue,
-          SUM(CASE WHEN category = 'Expense' THEN amount ELSE 0 END) as expenses
-        FROM transactions 
-        WHERE date >= date('now', '-12 months')
-        GROUP BY strftime('%Y-%m', date)
-        ORDER BY month DESC
-        LIMIT 12
-      `, (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
-
-    const stats: DashboardStats = {
-      totalRevenue,
-      totalExpenses,
-      netIncome: totalRevenue - totalExpenses,
-      pendingAmount,
-      paidAmount,
-      transactionCount,
-      monthlyData: monthlyData.map(row => ({
-        month: row.month,
-        revenue: row.revenue,
-        expenses: row.expenses
-      }))
-    };
+    // Format monthly data
+    const formattedMonthlyData = monthlyData.map(item => ({
+      month: `${item._id.year}-${String(item._id.month).padStart(2, '0')}`,
+      revenue: item.revenue,
+      expenses: item.expenses
+    }));
 
     res.json({
       success: true,
-      data: stats
+      data: {
+        totalRevenue,
+        totalExpenses,
+        netIncome,
+        pendingAmount,
+        paidAmount,
+        transactionCount,
+        monthlyData: formattedMonthlyData
+      }
     });
 
   } catch (error) {
-    console.error('Get dashboard stats error:', error);
+    console.error('Dashboard stats error:', error);
     res.status(500).json({
       success: false,
       error: 'Internal server error'
@@ -112,82 +107,16 @@ router.get('/stats', async (req, res) => {
   }
 });
 
-// Get category breakdown
-router.get('/categories', async (req, res) => {
+// GET /api/dashboard/recent-transactions - Get recent transactions
+router.get('/recent-transactions', async (req: Request, res: Response) => {
   try {
-    const categoryStats = await new Promise<any[]>((resolve, reject) => {
-      db.all(`
-        SELECT 
-          category,
-          COUNT(*) as count,
-          SUM(amount) as total,
-          AVG(amount) as average
-        FROM transactions 
-        GROUP BY category
-      `, (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
+    const userId = (req as any).user.userId;
+    const limit = parseInt(req.query['limit'] as string) || 5;
 
-    res.json({
-      success: true,
-      data: categoryStats
-    });
-
-  } catch (error) {
-    console.error('Get category stats error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
-  }
-});
-
-// Get status breakdown
-router.get('/status', async (req, res) => {
-  try {
-    const statusStats = await new Promise<any[]>((resolve, reject) => {
-      db.all(`
-        SELECT 
-          status,
-          COUNT(*) as count,
-          SUM(amount) as total
-        FROM transactions 
-        GROUP BY status
-      `, (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
-
-    res.json({
-      success: true,
-      data: statusStats
-    });
-
-  } catch (error) {
-    console.error('Get status stats error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
-  }
-});
-
-// Get recent transactions
-router.get('/recent', async (req, res) => {
-  try {
-    const recentTransactions = await new Promise<any[]>((resolve, reject) => {
-      db.all(`
-        SELECT * FROM transactions 
-        ORDER BY date DESC 
-        LIMIT 10
-      `, (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
+    const recentTransactions = await Transaction.find({ userId })
+      .sort({ date: -1 })
+      .limit(limit)
+      .populate('userId', 'username email');
 
     res.json({
       success: true,
@@ -195,7 +124,39 @@ router.get('/recent', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get recent transactions error:', error);
+    console.error('Recent transactions error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// GET /api/dashboard/category-breakdown - Get category breakdown
+router.get('/category-breakdown', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.userId;
+
+    const categoryBreakdown = await Transaction.aggregate([
+      {
+        $match: { userId: userId }
+      },
+      {
+        $group: {
+          _id: '$category',
+          total: { $sum: '$amount' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    res.json({
+      success: true,
+      data: categoryBreakdown
+    });
+
+  } catch (error) {
+    console.error('Category breakdown error:', error);
     res.status(500).json({
       success: false,
       error: 'Internal server error'

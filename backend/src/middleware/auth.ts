@@ -27,12 +27,12 @@ export function authenticateToken(
   }
 
   try {
-    const secret = process.env.JWT_SECRET || 'fallback-secret';
+    const secret = process.env['JWT_SECRET'] || 'fallback-secret';
     const decoded = jwt.verify(token, secret) as JwtPayload;
     req.user = decoded;
     next();
   } catch (error) {
-    res.status(403).json({ 
+    res.status(401).json({ 
       success: false, 
       error: 'Invalid or expired token' 
     });

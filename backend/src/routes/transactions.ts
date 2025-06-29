@@ -1,13 +1,36 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { body, validationResult, query } from 'express-validator';
 import { authenticateToken } from '../middleware/auth';
-import { db } from '../db/init';
-import { Transaction, TransactionFilters, TransactionCreateRequest, TransactionUpdateRequest, PaginatedResponse } from '../types';
+import Transaction from '../models/Transaction';
 
 const router = Router();
 
 // Apply authentication to all transaction routes
 router.use(authenticateToken);
+
+// Custom date validation function with better error handling
+const validateDate = (value: any) => {
+  if (!value) {
+    throw new Error('Date is required');
+  }
+  
+  // Convert to string if it's not already
+  const dateString = String(value).trim();
+  
+  if (!dateString) {
+    throw new Error('Date cannot be empty');
+  }
+  
+  // Try different date formats
+  const date = new Date(dateString);
+  
+  // Check if the date is valid
+  if (isNaN(date.getTime())) {
+    throw new Error(`Invalid date format: "${dateString}". Please use ISO format (2024-12-29), full ISO (2024-12-29T10:30:00.000Z), or timestamp (2024-12-29 10:30:00)`);
+  }
+  
+  return true;
+};
 
 // Get all transactions with filtering and pagination
 router.get('/', [
@@ -16,12 +39,11 @@ router.get('/', [
   query('search').optional().isString(),
   query('category').optional().isIn(['Revenue', 'Expense']).withMessage('Category must be Revenue or Expense'),
   query('status').optional().isIn(['Paid', 'Pending']).withMessage('Status must be Paid or Pending'),
-  query('user').optional().isString(),
-  query('dateFrom').optional().isISO8601().withMessage('dateFrom must be a valid date'),
-  query('dateTo').optional().isISO8601().withMessage('dateTo must be a valid date'),
+  query('dateFrom').optional().custom(validateDate).withMessage('dateFrom must be a valid date'),
+  query('dateTo').optional().custom(validateDate).withMessage('dateTo must be a valid date'),
   query('amountFrom').optional().isFloat({ min: 0 }).withMessage('amountFrom must be a positive number'),
   query('amountTo').optional().isFloat({ min: 0 }).withMessage('amountTo must be a positive number')
-], async (req, res) => {
+], async (req: Request, res: Response) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -32,97 +54,62 @@ router.get('/', [
       });
     }
 
-    const filters: TransactionFilters = req.query;
-    const page = parseInt(filters.page as string) || 1;
-    const limit = parseInt(filters.limit as string) || 20;
-    const offset = (page - 1) * limit;
+    const userId = (req as any).user.userId;
+    const page = parseInt(req.query['page'] as string) || 1;
+    const limit = parseInt(req.query['limit'] as string) || 20;
+    const skip = (page - 1) * limit;
 
-    // Build WHERE clause
-    let whereConditions: string[] = [];
-    let params: any[] = [];
+    // Build filter object
+    const filter: any = { userId };
 
-    if (filters.search) {
-      whereConditions.push('(description LIKE ? OR user_id LIKE ? OR CAST(amount AS TEXT) LIKE ?)');
-      const searchTerm = `%${filters.search}%`;
-      params.push(searchTerm, searchTerm, searchTerm);
+    if (req.query['search']) {
+      filter.$or = [
+        { description: { $regex: req.query['search'], $options: 'i' } },
+        { amount: { $regex: req.query['search'], $options: 'i' } }
+      ];
     }
 
-    if (filters.category) {
-      whereConditions.push('category = ?');
-      params.push(filters.category);
+    if (req.query['category']) {
+      filter.category = req.query['category'];
     }
 
-    if (filters.status) {
-      whereConditions.push('status = ?');
-      params.push(filters.status);
+    if (req.query['status']) {
+      filter.status = req.query['status'];
     }
 
-    if (filters.user) {
-      whereConditions.push('user_id = ?');
-      params.push(filters.user);
+    if (req.query['dateFrom'] || req.query['dateTo']) {
+      filter.date = {};
+      if (req.query['dateFrom']) filter.date.$gte = new Date(req.query['dateFrom'] as string);
+      if (req.query['dateTo']) filter.date.$lte = new Date(req.query['dateTo'] as string);
     }
 
-    if (filters.dateFrom) {
-      whereConditions.push('date >= ?');
-      params.push(filters.dateFrom);
+    if (req.query['amountFrom'] || req.query['amountTo']) {
+      filter.amount = {};
+      if (req.query['amountFrom']) filter.amount.$gte = parseFloat(req.query['amountFrom'] as string);
+      if (req.query['amountTo']) filter.amount.$lte = parseFloat(req.query['amountTo'] as string);
     }
-
-    if (filters.dateTo) {
-      whereConditions.push('date <= ?');
-      params.push(filters.dateTo);
-    }
-
-    if (filters.amountFrom !== undefined) {
-      whereConditions.push('amount >= ?');
-      params.push(filters.amountFrom);
-    }
-
-    if (filters.amountTo !== undefined) {
-      whereConditions.push('amount <= ?');
-      params.push(filters.amountTo);
-    }
-
-    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
 
     // Get total count
-    const countResult = await new Promise<number>((resolve, reject) => {
-      db.get(
-        `SELECT COUNT(*) as count FROM transactions ${whereClause}`,
-        params,
-        (err, row: any) => {
-          if (err) reject(err);
-          else resolve(row.count);
-        }
-      );
-    });
+    const total = await Transaction.countDocuments(filter);
 
     // Get paginated results
-    const transactions = await new Promise<Transaction[]>((resolve, reject) => {
-      db.all(
-        `SELECT * FROM transactions ${whereClause} ORDER BY date DESC LIMIT ? OFFSET ?`,
-        [...params, limit, offset],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows as Transaction[]);
-        }
-      );
-    });
+    const transactions = await Transaction.find(filter)
+      .sort({ date: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('userId', 'username email');
 
-    const totalPages = Math.ceil(countResult / limit);
-
-    const response: PaginatedResponse<Transaction> = {
-      data: transactions,
-      pagination: {
-        page,
-        limit,
-        total: countResult,
-        totalPages
-      }
-    };
+    const totalPages = Math.ceil(total / limit);
 
     res.json({
       success: true,
-      data: response
+      data: {
+        transactions,
+        total,
+        page,
+        limit,
+        totalPages
+      }
     });
 
   } catch (error) {
@@ -135,20 +122,13 @@ router.get('/', [
 });
 
 // Get single transaction by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const userId = (req as any).user.userId;
 
-    const transaction = await new Promise<Transaction>((resolve, reject) => {
-      db.get(
-        'SELECT * FROM transactions WHERE id = ?',
-        [id],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row as Transaction);
-        }
-      );
-    });
+    const transaction = await Transaction.findOne({ _id: id, userId })
+      .populate('userId', 'username email');
 
     if (!transaction) {
       return res.status(404).json({
@@ -173,15 +153,19 @@ router.get('/:id', async (req, res) => {
 
 // Create new transaction
 router.post('/', [
-  body('date').isISO8601().withMessage('Date must be a valid ISO date'),
+  body('date').custom(validateDate).withMessage('Date must be a valid date (ISO format, YYYY-MM-DD, or timestamp)'),
   body('amount').isFloat({ min: 0 }).withMessage('Amount must be a positive number'),
   body('category').isIn(['Revenue', 'Expense']).withMessage('Category must be Revenue or Expense'),
   body('status').isIn(['Paid', 'Pending']).withMessage('Status must be Paid or Pending'),
   body('description').notEmpty().withMessage('Description is required')
-], async (req, res) => {
+], async (req: Request, res: Response) => {
   try {
+    // Log the incoming request for debugging
+    console.log('Creating transaction with data:', JSON.stringify(req.body, null, 2));
+    
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      console.log('Validation errors:', errors.array());
       return res.status(400).json({
         success: false,
         error: 'Validation failed',
@@ -189,40 +173,22 @@ router.post('/', [
       });
     }
 
-    const transactionData: TransactionCreateRequest = req.body;
-    const userId = req.user!.userId;
+    const userId = (req as any).user.userId;
+    const transactionData = req.body;
 
-    const result = await new Promise<any>((resolve, reject) => {
-      db.run(
-        `INSERT INTO transactions (date, amount, category, status, user_id, user_profile, description) 
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          transactionData.date,
-          transactionData.amount,
-          transactionData.category,
-          transactionData.status,
-          userId,
-          'https://thispersondoesnotexist.com/',
-          transactionData.description
-        ],
-        function(err) {
-          if (err) reject(err);
-          else resolve({ id: this.lastID });
-        }
-      );
+    // Convert date to proper format
+    const date = new Date(transactionData.date);
+    console.log('Converted date:', date.toISOString());
+
+    const newTransaction = new Transaction({
+      ...transactionData,
+      date,
+      userId,
+      userProfile: 'https://thispersondoesnotexist.com/'
     });
 
-    // Get the created transaction
-    const newTransaction = await new Promise<Transaction>((resolve, reject) => {
-      db.get(
-        'SELECT * FROM transactions WHERE id = ?',
-        [result.id],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row as Transaction);
-        }
-      );
-    });
+    await newTransaction.save();
+    await newTransaction.populate('userId', 'username email');
 
     res.status(201).json({
       success: true,
@@ -240,12 +206,12 @@ router.post('/', [
 
 // Update transaction
 router.put('/:id', [
-  body('date').optional().isISO8601().withMessage('Date must be a valid ISO date'),
+  body('date').optional().custom(validateDate).withMessage('Date must be a valid date (ISO format, YYYY-MM-DD, or timestamp)'),
   body('amount').optional().isFloat({ min: 0 }).withMessage('Amount must be a positive number'),
   body('category').optional().isIn(['Revenue', 'Expense']).withMessage('Category must be Revenue or Expense'),
   body('status').optional().isIn(['Paid', 'Pending']).withMessage('Status must be Paid or Pending'),
   body('description').optional().notEmpty().withMessage('Description cannot be empty')
-], async (req, res) => {
+], async (req: Request, res: Response) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -257,92 +223,30 @@ router.put('/:id', [
     }
 
     const { id } = req.params;
-    const updateData: TransactionUpdateRequest = req.body;
+    const userId = (req as any).user.userId;
+    const updateData = req.body;
 
-    // Check if transaction exists
-    const existingTransaction = await new Promise<Transaction>((resolve, reject) => {
-      db.get(
-        'SELECT * FROM transactions WHERE id = ?',
-        [id],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row as Transaction);
-        }
-      );
-    });
+    // Convert date if provided
+    if (updateData.date) {
+      updateData.date = new Date(updateData.date);
+    }
 
-    if (!existingTransaction) {
+    const transaction = await Transaction.findOneAndUpdate(
+      { _id: id, userId },
+      updateData,
+      { new: true, runValidators: true }
+    ).populate('userId', 'username email');
+
+    if (!transaction) {
       return res.status(404).json({
         success: false,
         error: 'Transaction not found'
       });
     }
 
-    // Build update query
-    const updateFields: string[] = [];
-    const params: any[] = [];
-
-    if (updateData.date !== undefined) {
-      updateFields.push('date = ?');
-      params.push(updateData.date);
-    }
-
-    if (updateData.amount !== undefined) {
-      updateFields.push('amount = ?');
-      params.push(updateData.amount);
-    }
-
-    if (updateData.category !== undefined) {
-      updateFields.push('category = ?');
-      params.push(updateData.category);
-    }
-
-    if (updateData.status !== undefined) {
-      updateFields.push('status = ?');
-      params.push(updateData.status);
-    }
-
-    if (updateData.description !== undefined) {
-      updateFields.push('description = ?');
-      params.push(updateData.description);
-    }
-
-    if (updateFields.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'No fields to update'
-      });
-    }
-
-    updateFields.push('updated_at = CURRENT_TIMESTAMP');
-    params.push(id);
-
-    await new Promise<void>((resolve, reject) => {
-      db.run(
-        `UPDATE transactions SET ${updateFields.join(', ')} WHERE id = ?`,
-        params,
-        (err) => {
-          if (err) reject(err);
-          else resolve();
-        }
-      );
-    });
-
-    // Get updated transaction
-    const updatedTransaction = await new Promise<Transaction>((resolve, reject) => {
-      db.get(
-        'SELECT * FROM transactions WHERE id = ?',
-        [id],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row as Transaction);
-        }
-      );
-    });
-
     res.json({
       success: true,
-      data: updatedTransaction
+      data: transaction
     });
 
   } catch (error) {
@@ -355,39 +259,19 @@ router.put('/:id', [
 });
 
 // Delete transaction
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const userId = (req as any).user.userId;
 
-    // Check if transaction exists
-    const existingTransaction = await new Promise<Transaction>((resolve, reject) => {
-      db.get(
-        'SELECT * FROM transactions WHERE id = ?',
-        [id],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row as Transaction);
-        }
-      );
-    });
+    const transaction = await Transaction.findOneAndDelete({ _id: id, userId });
 
-    if (!existingTransaction) {
+    if (!transaction) {
       return res.status(404).json({
         success: false,
         error: 'Transaction not found'
       });
     }
-
-    await new Promise<void>((resolve, reject) => {
-      db.run(
-        'DELETE FROM transactions WHERE id = ?',
-        [id],
-        (err) => {
-          if (err) reject(err);
-          else resolve();
-        }
-      );
-    });
 
     res.json({
       success: true,

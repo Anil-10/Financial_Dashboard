@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import bcrypt from 'bcryptjs';
 
-const dbPath = process.env.DB_PATH || './data/financial_dashboard.db';
+const dbPath = process.env['DB_PATH'] || './data/financial_dashboard.db';
 
 // Ensure data directory exists
 const dataDir = path.dirname(dbPath);

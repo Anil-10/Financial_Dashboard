@@ -1,104 +1,24 @@
-import { Router } from 'express';
-import bcrypt from 'bcryptjs';
+// /routes/auth.ts
+
+import { Router, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { body, validationResult } from 'express-validator';
-import { db } from '../db/init';
-import { AuthRequest, AuthResponse, UserResponse } from '../types';
+import User from '../models/User';
 
 const router = Router();
 
-// Login route
-router.post('/login', [
-  body('username').notEmpty().withMessage('Username is required'),
-  body('password').notEmpty().withMessage('Password is required')
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation failed',
-        details: errors.array()
-      });
-    }
-
-    const { username, password }: AuthRequest = req.body;
-
-    // Find user by username
-    const user = await new Promise<any>((resolve, reject) => {
-      db.get(
-        'SELECT * FROM users WHERE username = ?',
-        [username],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row);
-        }
-      );
-    });
-
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid credentials'
-      });
-    }
-
-    // Verify password
-    const isValidPassword = await bcrypt.compare(password, user.password);
-    if (!isValidPassword) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid credentials'
-      });
-    }
-
-    // Generate JWT token
-    const secret = process.env.JWT_SECRET || 'fallback-secret';
-    const expiresIn = process.env.JWT_EXPIRES_IN || '24h';
-    
-    const token = jwt.sign(
-      { 
-        userId: user.id, 
-        username: user.username 
-      },
-      secret,
-      { expiresIn }
-    );
-
-    // Prepare user response (without password)
-    const userResponse: UserResponse = {
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      created_at: user.created_at,
-      updated_at: user.updated_at
-    };
-
-    const response: AuthResponse = {
-      user: userResponse,
-      token
-    };
-
-    res.json({
-      success: true,
-      data: response
-    });
-
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
-  }
-});
-
-// Register route
+// POST /api/auth/register
 router.post('/register', [
-  body('username').isLength({ min: 3 }).withMessage('Username must be at least 3 characters'),
-  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-  body('email').optional().isEmail().withMessage('Invalid email format')
-], async (req, res) => {
+  body('username')
+    .notEmpty().withMessage('Username is required')
+    .isLength({ min: 3 }).withMessage('Username must be at least 3 characters')
+    .isLength({ max: 30 }).withMessage('Username cannot exceed 30 characters'),
+  body('email')
+    .isEmail().withMessage('Valid email is required')
+    .normalizeEmail(),
+  body('password')
+    .isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+], async (req: Request, res: Response) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -109,75 +29,48 @@ router.post('/register', [
       });
     }
 
-    const { username, password, email } = req.body;
+    const { username, email, password } = req.body;
 
     // Check if user already exists
-    const existingUser = await new Promise<any>((resolve, reject) => {
-      db.get(
-        'SELECT id FROM users WHERE username = ?',
-        [username],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row);
-        }
-      );
+    const existingUser = await User.findOne({
+      $or: [{ username }, { email }]
     });
 
     if (existingUser) {
       return res.status(409).json({
         success: false,
-        error: 'Username already exists'
+        error: existingUser.username === username ? 'Username already exists' : 'Email already exists'
       });
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Generate user ID
-    const userId = `user_${Date.now()}`;
-
-    // Insert new user
-    await new Promise<void>((resolve, reject) => {
-      db.run(
-        'INSERT INTO users (id, username, password, email) VALUES (?, ?, ?, ?)',
-        [userId, username, hashedPassword, email],
-        (err) => {
-          if (err) reject(err);
-          else resolve();
-        }
-      );
-    });
-
-    // Generate JWT token
-    const secret = process.env.JWT_SECRET || 'fallback-secret';
-    const expiresIn = process.env.JWT_EXPIRES_IN || '24h';
-    
-    const token = jwt.sign(
-      { 
-        userId, 
-        username 
-      },
-      secret,
-      { expiresIn }
-    );
-
-    // Prepare user response
-    const userResponse: UserResponse = {
-      id: userId,
+    // Create new user
+    const newUser = new User({
       username,
       email,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    };
+      password
+    });
 
-    const response: AuthResponse = {
-      user: userResponse,
-      token
-    };
+    await newUser.save();
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: newUser._id, username: newUser.username },
+      process.env['JWT_SECRET'] || 'fallback-secret',
+      { expiresIn: '24h' }
+    );
 
     res.status(201).json({
       success: true,
-      data: response
+      data: {
+        user: {
+          id: newUser._id,
+          username: newUser.username,
+          email: newUser.email,
+          createdAt: newUser.createdAt,
+          updatedAt: newUser.updatedAt
+        },
+        token
+      }
     });
 
   } catch (error) {
@@ -189,4 +82,105 @@ router.post('/register', [
   }
 });
 
-export { router as authRoutes }; 
+// POST /api/auth/login
+router.post('/login', [
+  body('username').notEmpty().withMessage('Username is required'),
+  body('password').notEmpty().withMessage('Password is required')
+], async (req: Request, res: Response) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        details: errors.array()
+      });
+    }
+
+    const { username, password } = req.body;
+
+    // Find user by username
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
+
+    // Check password
+    const isPasswordValid = await user.comparePassword(password);
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      process.env['JWT_SECRET'] || 'fallback-secret',
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      success: true,
+      data: {
+        user: {
+          id: user._id,
+          username: user.username,
+          email: user.email,
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt
+        },
+        token
+      }
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// GET /api/auth/me - Get current user profile
+router.get('/me', async (req: Request, res: Response) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Access token required'
+      });
+    }
+
+    const decoded = jwt.verify(token, process.env['JWT_SECRET'] || 'fallback-secret') as any;
+    const user = await User.findById(decoded.userId).select('-password');
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: user
+    });
+
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(401).json({
+      success: false,
+      error: 'Invalid or expired token'
+    });
+  }
+});
+
+export { router as authRoutes };

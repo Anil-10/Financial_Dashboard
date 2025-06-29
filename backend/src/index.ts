@@ -9,27 +9,27 @@ import { transactionRoutes } from './routes/transactions';
 import { userRoutes } from './routes/users';
 import { dashboardRoutes } from './routes/dashboard';
 import { errorHandler } from './middleware/errorHandler';
-import { initializeDatabase } from './db/init';
+import { connectDatabase } from './config/database';
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env['PORT'] || 3001;
 
 // Security middleware
 app.use(helmet());
 
 // CORS configuration
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+  origin: process.env['CORS_ORIGIN'] || 'http://localhost:5173',
   credentials: true
 }));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000'), // 15 minutes
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100'), // limit each IP to 100 requests per windowMs
+  windowMs: parseInt(process.env['RATE_LIMIT_WINDOW_MS'] || '900000'), // 15 minutes
+  max: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS'] || '100'), // limit each IP to 100 requests per windowMs
   message: 'Too many requests from this IP, please try again later.'
 });
 app.use(limiter);
@@ -42,7 +42,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', (_req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
@@ -57,7 +57,7 @@ app.use('/api/users', userRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
 // 404 handler
-app.use('*', (req, res) => {
+app.use('*', (_req, res) => {
   res.status(404).json({ 
     success: false, 
     error: 'Route not found' 
@@ -70,8 +70,8 @@ app.use(errorHandler);
 // Initialize database and start server
 async function startServer() {
   try {
-    await initializeDatabase();
-    console.log('Database initialized successfully');
+    await connectDatabase();
+    console.log('✅ Database connected successfully');
     
     app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
@@ -79,7 +79,7 @@ async function startServer() {
       console.log(`🏥 Health check at http://localhost:${PORT}/health`);
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
